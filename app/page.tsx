@@ -1,69 +1,263 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
+import { useMemo, useRef, Suspense } from "react";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import {
+  Environment,
+  Lightformer,
+  MeshTransmissionMaterial,
+  useGLTF,
+} from "@react-three/drei";
+import * as THREE from "three";
+
+const DEPTH = 1.6; // baked into geometry, so normals stay correct
+const START_X = 0.2;
+const START_Y = -0.55;
+const SPIN_SPEED = 0.25; // radians per second, lower = slower
+const MOBILE_BREAKPOINT = 768;
+const MIN_FIT = 0.6; // smallest logo scale on narrow screens
+
+function makeCanvasTexture(
+  w: number,
+  h: number,
+  draw: (ctx: CanvasRenderingContext2D, w: number, h: number) => void,
+) {
+  const c = document.createElement("canvas");
+  c.width = w;
+  c.height = h;
+  draw(c.getContext("2d")!, w, h);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+// one place for layout, so the logo and the glow always move together
+function useLayout() {
+  const size = useThree((s) => s.size);
+  const isMobile = size.width < MOBILE_BREAKPOINT;
+  const fit = THREE.MathUtils.clamp(size.width / size.height / 1.4, MIN_FIT, 1);
+  const logoY = isMobile ? 0.35 : 0;
+  return { isMobile, fit, logoY };
+}
+
+// what the camera sees behind the logo: clean dark wall
+function useWallTexture() {
+  return useMemo(
+    () =>
+      makeCanvasTexture(512, 512, (ctx, w, h) => {
+        const g = ctx.createLinearGradient(0, 0, w, h);
+        g.addColorStop(0, "#020202");
+        g.addColorStop(0.55, "#000000");
+        g.addColorStop(1, "#080808");
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, w, h);
+      }),
+    [],
+  );
+}
+
+// what ONLY the glass sees (refraction buffer). the camera never sees this
+function useStripesTexture() {
+  return useMemo(
+    () =>
+      makeCanvasTexture(1024, 1024, (ctx, w, h) => {
+        ctx.fillStyle = "#eef3ff";
+        ctx.fillRect(0, 0, w, h);
+
+        // offsets are fractions of width from the center
+        const stripes = [
+          { x: -0.46, w: 0.02, c: "#0b1020" },
+          { x: -0.34, w: 0.06, c: "#3b5bff" },
+          { x: -0.2, w: 0.012, c: "#ffffff" },
+          { x: -0.1, w: 0.035, c: "#0b1020" },
+          { x: 0.02, w: 0.015, c: "#ffffff" },
+          { x: 0.12, w: 0.07, c: "#8fa8ff" },
+          { x: 0.26, w: 0.012, c: "#0b1020" },
+          { x: 0.36, w: 0.04, c: "#3b5bff" },
+          { x: 0.46, w: 0.02, c: "#ffffff" },
+        ];
+
+        ctx.translate(w / 2, h / 2);
+        ctx.rotate(0.35);
+        for (const s of stripes) {
+          ctx.fillStyle = s.c;
+          ctx.fillRect(s.x * w, -h * 1.5, s.w * w, h * 3);
+        }
+      }),
+    [],
+  );
+}
+
+function SoftShadow() {
+  const { fit, logoY } = useLayout();
+
+  const tex = useMemo(
+    () =>
+      makeCanvasTexture(512, 512, (ctx, w, h) => {
+        const g = ctx.createRadialGradient(
+          w / 2,
+          h / 2,
+          0,
+          w / 2,
+          h / 2,
+          w / 2,
+        );
+        g.addColorStop(0, "rgba(120,150,235,0.55)");
+        g.addColorStop(0.5, "rgba(140,165,240,0.25)");
+        g.addColorStop(1, "rgba(160,185,250,0)");
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, w, h);
+      }),
+    [],
+  );
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
+    <mesh position={[1.1 * fit, logoY - 1.0 * fit, -2.9]} scale={fit}>
+      <planeGeometry args={[6.5, 5]} />
+      <meshBasicMaterial
+        map={tex}
+        transparent
+        depthWrite={false}
+        toneMapped={false}
+      />
+    </mesh>
+  );
+}
+
+function GlassLogo() {
+  const { scene } = useGLTF("/MainLongo.glb");
+  const group = useRef<THREE.Group>(null);
+  const stripes = useStripesTexture();
+  const spin = useRef(START_Y); // running spin angle
+  const { isMobile, fit, logoY } = useLayout();
+
+  // bake world matrix + depth into cloned geometry (correct normals)
+  const geos = useMemo(() => {
+    const out: THREE.BufferGeometry[] = [];
+    scene.updateMatrixWorld(true);
+    scene.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (m.isMesh) {
+        const g = m.geometry.clone();
+        g.applyMatrix4(m.matrixWorld);
+        g.scale(1, 1, DEPTH);
+        out.push(g);
+      }
+    });
+    return out;
+  }, [scene]);
+
+  useFrame(({ pointer }, delta) => {
+    if (!group.current) return;
+    const g = group.current;
+
+    spin.current += delta * SPIN_SPEED;
+
+    g.rotation.y = THREE.MathUtils.lerp(
+      g.rotation.y,
+      spin.current + pointer.x * 0.15,
+      0.05,
+    );
+    g.rotation.x = THREE.MathUtils.lerp(
+      g.rotation.x,
+      START_X - pointer.y * 0.1,
+      0.05,
+    );
+  });
+
+  return (
+    <group
+      ref={group}
+      rotation={[START_X, START_Y, 0]}
+      position={[0, logoY, 0]}
+      scale={1.2 * fit}
+    >
+      {geos.map((geo, i) => (
+        <mesh key={i} geometry={geo}>
+          <MeshTransmissionMaterial
+            background={stripes}
+            backside={!isMobile}
+            backsideThickness={0.6}
+            samples={isMobile ? 3 : 6}
+            resolution={isMobile ? 512 : undefined}
+            thickness={1.5}
+            roughness={0}
+            ior={1.5}
+            chromaticAberration={0.06}
+            anisotropicBlur={0}
+            distortion={0.25}
+            distortionScale={0.3}
+            temporalDistortion={0}
+            color="#ffffff"
+            attenuationColor="#b8caff"
+            attenuationDistance={5}
+            clearcoat={1}
+            clearcoatRoughness={0}
+            envMapIntensity={2.5}
+          />
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
+function SceneContents() {
+  const wall = useWallTexture();
+  return (
+    <>
+      {/* camera sees this; the glass overrides it with its own stripes */}
+      <primitive object={wall} attach="background" />
+
+      <Environment resolution={256}>
+        <color attach="background" args={["#0b1020"]} />
+        <Lightformer
+          form="rect"
+          intensity={8}
+          position={[0, 5, 3]}
+          scale={[12, 0.5, 1]}
         />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
+        <Lightformer
+          form="rect"
+          intensity={6}
+          position={[-5, 1, 2]}
+          scale={[0.6, 10, 1]}
+        />
+        <Lightformer
+          form="rect"
+          intensity={6}
+          position={[5, 0, 2]}
+          scale={[0.3, 10, 1]}
+        />
+        <Lightformer
+          form="rect"
+          intensity={3}
+          position={[0, -4, 2]}
+          scale={[10, 0.4, 1]}
+          color="#9db8ff"
+        />
+      </Environment>
+
+      <Suspense fallback={null}>
+        <SoftShadow />
+        <GlassLogo />
+      </Suspense>
+    </>
+  );
+}
+
+export default function Scene() {
+  return (
+    <div className="scene-background">
+      <Canvas
+        camera={{ position: [0, 0, 3.5], fov: 40 }}
+        dpr={[1, 1.25]}
+        gl={{ antialias: true, powerPreference: "high-performance" }}
+      >
+        <SceneContents />
+      </Canvas>
     </div>
   );
 }
+
+useGLTF.preload("/MainLongo.glb");
+useGLTF.preload("/Logo.glb");

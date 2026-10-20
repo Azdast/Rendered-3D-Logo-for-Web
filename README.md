@@ -2,7 +2,7 @@
 
 <!-- Main photo: save your best render as docs/images/preview.png -->
 
-![Main preview](docs/images/pe.png)
+![Main preview](/doc/images/pe.png)
 
 A web project for showing a rendered 3D logo in the browser, built with Next.js.
 
